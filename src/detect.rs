@@ -137,6 +137,18 @@ pub fn detect_state(agent: Option<Agent>, screen_content: &str) -> AgentState {
 // ---------------------------------------------------------------------------
 
 fn detect_pi(content: &str) -> AgentState {
+    // pi shows a tools-profile approval menu when blocked waiting for permission.
+    // The menu always contains at least one of these action labels.
+    if content.contains("Allow once")
+        || content.contains("Allow always")
+        || content.contains("Deny once")
+        || content.contains("Deny always")
+        || content.contains("Switch profile")
+        || content.contains("View full command")
+    {
+        return AgentState::Blocked;
+    }
+
     // pi shows "Working..." when the agent is processing
     if content.contains("Working...") {
         return AgentState::Working;
@@ -896,6 +908,38 @@ mod tests {
     #[test]
     fn pi_idle_no_working_text() {
         assert_eq!(detect_pi("some output\n\n> ready"), AgentState::Idle);
+    }
+
+    #[test]
+    fn pi_blocked_allow_once() {
+        let screen = "bash: rm -rf /tmp/test\n\n→ ✅ Allow once\n  ✅ Allow always (add to profile)\n  🚫 Deny once";
+        assert_eq!(detect_pi(screen), AgentState::Blocked);
+    }
+
+    #[test]
+    fn pi_blocked_deny_always() {
+        let screen = "  ✅ Allow once\n→ 🚫 Deny always (add to profile)\n  🔄 Switch profile";
+        assert_eq!(detect_pi(screen), AgentState::Blocked);
+    }
+
+    #[test]
+    fn pi_blocked_switch_profile() {
+        let screen =
+            "  ✅ Allow always (with pattern)\n  🔄 Switch profile\n  👁  View full command";
+        assert_eq!(detect_pi(screen), AgentState::Blocked);
+    }
+
+    #[test]
+    fn pi_blocked_view_full_command() {
+        let screen = "  🚫 Deny once\n  👁  View full command";
+        assert_eq!(detect_pi(screen), AgentState::Blocked);
+    }
+
+    #[test]
+    fn pi_blocked_takes_priority_over_working() {
+        // Edge case: approval menu visible while "Working..." also on screen
+        let screen = "Working...\n→ ✅ Allow once\n  🚫 Deny once";
+        assert_eq!(detect_pi(screen), AgentState::Blocked);
     }
 
     // ---- Claude Code ----
