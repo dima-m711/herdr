@@ -1,13 +1,298 @@
 use std::ffi::OsStr;
 use std::io::Write;
+use std::os::fd::RawFd;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::ptr::NonNull;
 use std::sync::OnceLock;
 
-use super::{ClipboardCommand, ForegroundJob, ForegroundProcess, Signal};
+use super::{
+    read_limited_reader, ClipboardCommand, ClipboardImage, ForegroundJob, ForegroundProcess,
+    LimitedRead, Signal,
+};
 
 const PROC_PGRP_ONLY: u32 = 2;
+const SERVER_NOFILE_LIMIT_TARGET: libc::rlim_t = 8192;
+const CF_STRING_ENCODING_UTF8: u32 = 0x0800_0100;
+
+pub(crate) fn scrollback_editor_argv(path: &Path) -> std::io::Result<Vec<String>> {
+    let quoted_path = shell_quote(&path.display().to_string());
+    let command = format!(
+        r#"scrollback_file={quoted_path}; eval "${{EDITOR:-vi}} \"\$scrollback_file\""; status=$?; rm -f "$scrollback_file"; exit $status"#
+    );
+    Ok(vec!["/bin/sh".to_string(), "-c".to_string(), command])
+}
+
+fn shell_quote(value: &str) -> String {
+    if !value.is_empty()
+        && value.chars().all(|ch| {
+            ch.is_ascii_alphanumeric()
+                || matches!(
+                    ch,
+                    '@' | '%' | '_' | '+' | '=' | ':' | ',' | '.' | '/' | '-'
+                )
+        })
+    {
+        return value.to_string();
+    }
+
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+#[repr(C)]
+struct TisInputSource {
+    _private: [u8; 0],
+}
+
+type TisInputSourceRef = *const TisInputSource;
+type CfTypeRef = *const libc::c_void;
+type CfStringRef = *const libc::c_void;
+type OsStatus = libc::c_int;
+type Boolean = libc::c_uchar;
+type CfIndex = isize;
+
+#[link(name = "Carbon", kind = "framework")]
+extern "C" {
+    #[link_name = "kTISPropertyInputSourceID"]
+    static TIS_PROPERTY_INPUT_SOURCE_ID: CfStringRef;
+
+    #[link_name = "TISCopyCurrentKeyboardInputSource"]
+    fn tis_copy_current_keyboard_input_source() -> TisInputSourceRef;
+
+    #[link_name = "TISCopyCurrentASCIICapableKeyboardLayoutInputSource"]
+    fn tis_copy_current_ascii_capable_keyboard_layout_input_source() -> TisInputSourceRef;
+
+    #[link_name = "TISGetInputSourceProperty"]
+    fn tis_get_input_source_property(
+        input_source: TisInputSourceRef,
+        property_key: CfStringRef,
+    ) -> CfTypeRef;
+
+    #[link_name = "TISSelectInputSource"]
+    fn tis_select_input_source(input_source: TisInputSourceRef) -> OsStatus;
+}
+
+#[link(name = "CoreFoundation", kind = "framework")]
+extern "C" {
+    #[link_name = "CFRelease"]
+    fn cf_release(value: CfTypeRef);
+
+    #[link_name = "CFEqual"]
+    fn cf_equal(left: CfTypeRef, right: CfTypeRef) -> Boolean;
+
+    #[link_name = "CFStringGetCStringPtr"]
+    fn cf_string_get_cstring_ptr(value: CfStringRef, encoding: u32) -> *const libc::c_char;
+
+    #[link_name = "CFStringGetLength"]
+    fn cf_string_get_length(value: CfStringRef) -> CfIndex;
+
+    #[link_name = "CFStringGetMaximumSizeForEncoding"]
+    fn cf_string_get_maximum_size_for_encoding(length: CfIndex, encoding: u32) -> CfIndex;
+
+    #[link_name = "CFStringGetCString"]
+    fn cf_string_get_cstring(
+        value: CfStringRef,
+        buffer: *mut libc::c_char,
+        buffer_size: CfIndex,
+        encoding: u32,
+    ) -> Boolean;
+
+    #[link_name = "kCFRunLoopDefaultMode"]
+    static CF_RUN_LOOP_DEFAULT_MODE: CfStringRef;
+
+    #[link_name = "CFRunLoopRunInMode"]
+    fn cf_run_loop_run_in_mode(
+        mode: CfStringRef,
+        seconds: f64,
+        return_after_source_handled: Boolean,
+    ) -> libc::c_int;
+}
+
+/// Pump the main thread's run loop once (non-blocking) so the process receives the
+/// `kTISNotifySelectedKeyboardInputSourceChanged` notification and refreshes the per-process cache
+/// that `TISCopyCurrentKeyboardInputSource` reads. That notification arrives only via the main
+/// thread's run loop, so a process that never runs a CFRunLoop (the headless server) reads a stale
+/// source. Must run on the main thread.
+pub(crate) fn pump_input_source_runloop() {
+    debug_assert!(
+        // SAFETY: `pthread_main_np` is always safe to call.
+        unsafe { libc::pthread_main_np() } != 0,
+        "pump_input_source_runloop must run on the main thread"
+    );
+    // SAFETY: `CFRunLoopRunInMode` is thread-safe; a 0-second call drains the ready sources and
+    // returns immediately (no blocking). `CF_RUN_LOOP_DEFAULT_MODE` is a framework-owned constant.
+    unsafe {
+        let _ = cf_run_loop_run_in_mode(CF_RUN_LOOP_DEFAULT_MODE, 0.0, 0);
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct InputSourceRestore {
+    previous: NonNull<TisInputSource>,
+}
+
+impl Drop for InputSourceRestore {
+    fn drop(&mut self) {
+        // SAFETY: `previous` is a retained TIS input source created by
+        // `TISCopyCurrentKeyboardInputSource`; selecting it and releasing that
+        // retain follows the Carbon Input Source Services ownership contract.
+        unsafe {
+            let previous = self.previous.as_ptr();
+            let status = tis_select_input_source(previous);
+            cf_release(previous.cast());
+            if status != 0 {
+                tracing::debug!(
+                    status,
+                    "failed to restore host input source after prefix mode"
+                );
+            }
+        }
+    }
+}
+
+pub(crate) fn switch_to_ascii_input_source() -> Option<InputSourceRestore> {
+    // SAFETY: TISCopy* functions return retained references or null. Each
+    // retained reference is either transferred into `InputSourceRestore` or
+    // released before returning; TISSelectInputSource accepts live TIS refs.
+    unsafe {
+        let current =
+            NonNull::new(tis_copy_current_keyboard_input_source() as *mut TisInputSource)?;
+        let Some(ascii) = NonNull::new(
+            tis_copy_current_ascii_capable_keyboard_layout_input_source() as *mut TisInputSource,
+        ) else {
+            cf_release(current.as_ptr().cast());
+            return None;
+        };
+
+        if input_source_ids_equal(current.as_ptr(), ascii.as_ptr()) {
+            cf_release(current.as_ptr().cast());
+            cf_release(ascii.as_ptr().cast());
+            return None;
+        }
+
+        let debug_ids = tracing::enabled!(tracing::Level::DEBUG).then(|| {
+            (
+                input_source_id(current.as_ptr()),
+                input_source_id(ascii.as_ptr()),
+            )
+        });
+
+        let status = tis_select_input_source(ascii.as_ptr());
+        cf_release(ascii.as_ptr().cast());
+        if status != 0 {
+            cf_release(current.as_ptr().cast());
+            tracing::debug!(status, "failed to switch host input source for prefix mode");
+            return None;
+        }
+
+        if let Some((Some(from), Some(to))) = debug_ids {
+            tracing::debug!(from, to, "switched host input source for prefix mode");
+        }
+
+        Some(InputSourceRestore { previous: current })
+    }
+}
+
+unsafe fn input_source_ids_equal(left: TisInputSourceRef, right: TisInputSourceRef) -> bool {
+    let left_property = tis_get_input_source_property(left, TIS_PROPERTY_INPUT_SOURCE_ID);
+    let right_property = tis_get_input_source_property(right, TIS_PROPERTY_INPUT_SOURCE_ID);
+    !left_property.is_null()
+        && !right_property.is_null()
+        && cf_equal(left_property, right_property) != 0
+}
+
+unsafe fn input_source_id(input_source: TisInputSourceRef) -> Option<String> {
+    let property =
+        tis_get_input_source_property(input_source, TIS_PROPERTY_INPUT_SOURCE_ID) as CfStringRef;
+    cf_string_to_string(property)
+}
+
+unsafe fn cf_string_to_string(value: CfStringRef) -> Option<String> {
+    if value.is_null() {
+        return None;
+    }
+
+    let direct = cf_string_get_cstring_ptr(value, CF_STRING_ENCODING_UTF8);
+    if !direct.is_null() {
+        return std::ffi::CStr::from_ptr(direct)
+            .to_str()
+            .ok()
+            .map(str::to_owned);
+    }
+
+    let length = cf_string_get_length(value);
+    if length < 0 {
+        return None;
+    }
+    let max_bytes = cf_string_get_maximum_size_for_encoding(length, CF_STRING_ENCODING_UTF8);
+    if max_bytes < 0 {
+        return None;
+    }
+    let buffer_len = usize::try_from(max_bytes).ok()?.checked_add(1)?;
+    let mut buffer = vec![0 as libc::c_char; buffer_len];
+    let buffer_size = CfIndex::try_from(buffer.len()).ok()?;
+    if cf_string_get_cstring(
+        value,
+        buffer.as_mut_ptr(),
+        buffer_size,
+        CF_STRING_ENCODING_UTF8,
+    ) == 0
+    {
+        return None;
+    }
+
+    std::ffi::CStr::from_ptr(buffer.as_ptr())
+        .to_str()
+        .ok()
+        .map(str::to_owned)
+}
+
+pub fn raise_server_nofile_limit() {
+    match raise_nofile_limit(SERVER_NOFILE_LIMIT_TARGET) {
+        Ok(None) => {}
+        Ok(Some((previous, target))) => {
+            tracing::info!(previous, target, "raised server file descriptor soft limit")
+        }
+        Err(err) => tracing::warn!(err = %err, "failed to raise server file descriptor limit"),
+    }
+}
+
+fn raise_nofile_limit(
+    target: libc::rlim_t,
+) -> std::io::Result<Option<(libc::rlim_t, libc::rlim_t)>> {
+    let mut limit = std::mem::MaybeUninit::<libc::rlimit>::uninit();
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, limit.as_mut_ptr()) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+
+    let mut limit = unsafe { limit.assume_init() };
+    let Some(target) = target_nofile_soft_limit(limit.rlim_cur, limit.rlim_max, target) else {
+        return Ok(None);
+    };
+
+    let previous = limit.rlim_cur;
+    limit.rlim_cur = target;
+    if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+
+    Ok(Some((previous, target)))
+}
+
+fn target_nofile_soft_limit(
+    current: libc::rlim_t,
+    hard: libc::rlim_t,
+    target: libc::rlim_t,
+) -> Option<libc::rlim_t> {
+    let target = if hard == libc::RLIM_INFINITY {
+        target
+    } else {
+        target.min(hard)
+    };
+
+    (current < target).then_some(target)
+}
 
 /// Collect the foreground terminal job for a given child PID.
 pub fn foreground_job(child_pid: u32) -> Option<ForegroundJob> {
@@ -29,11 +314,13 @@ pub fn foreground_job(child_pid: u32) -> Option<ForegroundJob> {
         let Some(name) = comm_from_bsdinfo(&info) else {
             continue;
         };
+        let argv = process_argv(pid);
         processes.push(ForegroundProcess {
             pid,
             name,
             argv0: process_argv0_name(pid),
-            cmdline: process_cmdline(pid),
+            cmdline: argv.as_ref().map(|parts| parts.join(" ")),
+            argv,
         });
     }
 
@@ -44,6 +331,26 @@ pub fn foreground_job(child_pid: u32) -> Option<ForegroundJob> {
     Some(ForegroundJob {
         process_group_id: fg_pgid,
         processes,
+    })
+}
+
+pub fn foreground_group_leader_job(process_group_id: u32) -> Option<ForegroundJob> {
+    let info = process_bsdinfo(process_group_id)?;
+    if info.pbi_pgid != process_group_id {
+        return None;
+    }
+
+    let name = comm_from_bsdinfo(&info)?;
+    let argv = process_argv(process_group_id);
+    Some(ForegroundJob {
+        process_group_id,
+        processes: vec![ForegroundProcess {
+            pid: process_group_id,
+            name,
+            argv0: process_argv0_name(process_group_id),
+            cmdline: argv.as_ref().map(|parts| parts.join(" ")),
+            argv,
+        }],
     })
 }
 
@@ -98,10 +405,16 @@ pub fn foreground_process_group_id(pid: u32) -> Option<u32> {
 
     let fg = info.e_tpgid;
     if fg > 0 {
+        #[allow(clippy::unnecessary_cast)] // info.e_tpgid (pid_t) type is platform-dependent
         Some(fg as u32)
     } else {
         None
     }
+}
+
+pub fn foreground_process_group_id_for_tty_fd(fd: RawFd) -> Option<u32> {
+    let pgid = unsafe { libc::tcgetpgrp(fd) };
+    (pgid > 0).then_some(pgid as u32)
 }
 
 /// Get the effective process name from `argv[0]` via `sysctl(KERN_PROCARGS2)`.
@@ -200,6 +513,98 @@ pub fn write_clipboard(bytes: &[u8]) -> bool {
         },
         bytes,
     )
+}
+
+pub fn read_clipboard_text() -> Option<String> {
+    const MAX_CLIPBOARD_TEXT_BYTES: usize = 1024 * 1024;
+
+    let mut child = Command::new("pbpaste")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    let stdout = child.stdout.take()?;
+    let read = match read_limited_reader(stdout, MAX_CLIPBOARD_TEXT_BYTES) {
+        Ok(LimitedRead::Oversized) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return None;
+        }
+        Ok(read) => read,
+        Err(_) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return None;
+        }
+    };
+    let status = child.wait().ok()?;
+    if !status.success() {
+        return None;
+    }
+    match read {
+        LimitedRead::Complete(bytes) => String::from_utf8(bytes).ok(),
+        LimitedRead::Empty => None,
+        LimitedRead::Oversized => unreachable!("oversized clipboard text is handled before wait"),
+    }
+}
+
+pub fn open_url(url: &str) -> std::io::Result<()> {
+    Command::new("open")
+        .arg(url)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    Ok(())
+}
+
+pub fn read_clipboard_image() -> Option<ClipboardImage> {
+    let path = std::env::temp_dir().join(format!(
+        "herdr-clipboard-image-{}-{}.png",
+        std::process::id(),
+        unique_timestamp_nanos()
+    ));
+    let script = format!(
+        "set png_data to (the clipboard as «class PNGf»)\nset fp to open for access POSIX file \"{}\" with write permission\nwrite png_data to fp\nclose access fp",
+        path.display()
+    );
+
+    let status = Command::new("osascript")
+        .arg("-e")
+        .arg(script)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .ok()?;
+
+    if !status.success() {
+        let _ = std::fs::remove_file(&path);
+        return None;
+    }
+
+    let bytes = match std::fs::File::open(&path).ok().and_then(|file| {
+        read_limited_reader(file, crate::protocol::MAX_CLIPBOARD_IMAGE_PAYLOAD).ok()
+    }) {
+        Some(LimitedRead::Complete(bytes)) => bytes,
+        Some(LimitedRead::Empty | LimitedRead::Oversized) | None => {
+            let _ = std::fs::remove_file(&path);
+            return None;
+        }
+    };
+    let _ = std::fs::remove_file(&path);
+    Some(ClipboardImage {
+        bytes,
+        extension: "png",
+    })
+}
+
+fn unique_timestamp_nanos() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0)
 }
 
 /// Show a native macOS notification.
@@ -411,10 +816,9 @@ fn comm_from_bsdinfo(info: &libc::proc_bsdinfo) -> Option<String> {
     String::from_utf8(bytes).ok()
 }
 
-fn process_cmdline(pid: u32) -> Option<String> {
+fn process_argv(pid: u32) -> Option<Vec<String>> {
     let buf = kern_procargs2(pid)?;
-    let argv = procargs2_argv(&buf)?;
-    Some(argv.join(" "))
+    procargs2_argv(&buf)
 }
 
 fn procargs2_argv(buf: &[u8]) -> Option<Vec<String>> {
@@ -587,6 +991,27 @@ pub fn process_exists(pid: u32) -> bool {
 mod tests {
     use super::*;
 
+    #[test]
+    fn nofile_target_raises_low_soft_limit_to_cap_when_hard_is_unlimited() {
+        assert_eq!(
+            target_nofile_soft_limit(256, libc::RLIM_INFINITY, 8192),
+            Some(8192)
+        );
+    }
+
+    #[test]
+    fn nofile_target_respects_finite_hard_limit() {
+        assert_eq!(target_nofile_soft_limit(256, 4096, 8192), Some(4096));
+    }
+
+    #[test]
+    fn nofile_target_does_not_lower_existing_soft_limit() {
+        assert_eq!(
+            target_nofile_soft_limit(16_384, libc::RLIM_INFINITY, 8192),
+            None
+        );
+    }
+
     fn build_procargs2(exec_path: &str, argv: &[&str], env: &[&str]) -> Vec<u8> {
         let mut buf = Vec::new();
         buf.extend_from_slice(&(argv.len() as i32).to_ne_bytes());
@@ -743,5 +1168,16 @@ printf '%s\n' "$@" > "$HERDR_NOTIFY_ARGS"
             args,
             "-e\non run argv\n-e\ndisplay notification (item 2 of argv) with title (item 1 of argv)\n-e\nend run\ntitle\nbody\n"
         );
+    }
+
+    #[test]
+    fn scrollback_editor_argv_preserves_unix_editor_shell_semantics() {
+        let path = std::path::Path::new("/tmp/herdr scrollback.txt");
+        let argv = scrollback_editor_argv(path).unwrap();
+
+        assert_eq!(argv[0], "/bin/sh");
+        assert_eq!(argv[1], "-c");
+        assert!(argv[2].contains("EDITOR:-vi"));
+        assert!(argv[2].contains("/tmp/herdr scrollback.txt"));
     }
 }

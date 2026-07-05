@@ -13,6 +13,7 @@ use crate::app::state::AppState;
 use crate::app::Mode;
 use crate::ghostty::{KittyImageDescriptor, KittyImageFormat, KittyImagePlacement};
 use crate::layout::PaneId;
+use crate::terminal::TerminalRuntimeRegistry;
 
 const KITTY_CHUNK_BYTES: usize = 3072;
 const HOST_IMAGE_ID_BASE: u32 = 10_000;
@@ -119,6 +120,8 @@ struct ClippedPlacement {
 pub(crate) struct HostGraphicsCache {
     images: HashMap<u32, ImageSignature>,
     placements: HashMap<(u32, u32), PlacementSignature>,
+    /// Host image currently backing each (pane, source image id) pair.
+    sources: HashMap<(PaneId, u32), u32>,
     view: Option<HostViewKey>,
 }
 
@@ -133,11 +136,15 @@ pub(crate) fn is_enabled() -> bool {
     KITTY_GRAPHICS_ENABLED.load(Ordering::Acquire)
 }
 
-pub(crate) fn paint_local_pane_graphics(app: &AppState, cell_size: HostCellSize) -> io::Result<()> {
+pub(crate) fn paint_local_pane_graphics(
+    app: &AppState,
+    terminal_runtimes: &TerminalRuntimeRegistry,
+    cell_size: HostCellSize,
+) -> io::Result<()> {
     let cache = LOCAL_HOST_GRAPHICS.get_or_init(|| Mutex::new(HostGraphicsCache::default()));
     let mut bytes = Vec::new();
     if let Ok(mut cache) = cache.lock() {
-        bytes = encode_local_pane_graphics(app, cell_size, &mut cache);
+        bytes = encode_local_pane_graphics(app, terminal_runtimes, cell_size, &mut cache);
     }
     if bytes.is_empty() {
         return Ok(());
@@ -155,6 +162,7 @@ pub(crate) fn paint_local_pane_graphics(app: &AppState, cell_size: HostCellSize)
 
 pub(crate) fn encode_local_pane_graphics(
     app: &AppState,
+    terminal_runtimes: &TerminalRuntimeRegistry,
     cell_size: HostCellSize,
     cache: &mut HostGraphicsCache,
 ) -> Vec<u8> {
@@ -183,7 +191,8 @@ pub(crate) fn encode_local_pane_graphics(
 
     let view_key = active_view_key(app);
     let uploaded_images = cache.images.clone();
-    let placements = collect_visible_placements(app, cell_size, &uploaded_images);
+    let placements =
+        collect_visible_placements(app, terminal_runtimes, cell_size, &uploaded_images);
     tracing::debug!(
         placements_collected = placements.len(),
         "collect_visible_placements result"
@@ -197,6 +206,7 @@ pub(crate) fn encode_local_pane_graphics(
         view_changed,
         &mut cache.images,
         &mut cache.placements,
+        &mut cache.sources,
     );
     tracing::debug!(
         placements = placements.len(),
@@ -208,13 +218,68 @@ pub(crate) fn encode_local_pane_graphics(
     bytes
 }
 
+pub(crate) fn has_visible_pane_graphics(
+    app: &AppState,
+    terminal_runtimes: &TerminalRuntimeRegistry,
+    cell_size: HostCellSize,
+) -> bool {
+    if app.mode != Mode::Terminal || !cell_size.is_known() {
+        return false;
+    }
+
+    let Some(ws_idx) = app.active else {
+        return false;
+    };
+    if app
+        .workspaces
+        .get(ws_idx)
+        .and_then(crate::workspace::Workspace::active_tab)
+        .is_none()
+    {
+        return false;
+    }
+
+    for info in &app.view.pane_infos {
+        let Some(runtime) = app.runtime_for_pane_in_workspace(terminal_runtimes, ws_idx, info.id)
+        else {
+            continue;
+        };
+        let scrollback_offset = runtime
+            .scroll_metrics()
+            .map(|m| m.offset_from_bottom as u32)
+            .unwrap_or(0);
+        for placement in runtime.kitty_image_placements_with_data_filter(|_| false) {
+            let host_placement = HostPlacement {
+                pane_id: info.id,
+                area: info.inner_rect,
+                cell_size,
+                placement,
+                scrollback_offset,
+            };
+            if clipped_placement(&host_placement).is_some() {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 fn encode_graphics_update(
     bytes: &mut Vec<u8>,
     placements: &[HostPlacement],
     view_changed: bool,
     host_images: &mut HashMap<u32, ImageSignature>,
     host_placements: &mut HashMap<(u32, u32), PlacementSignature>,
+    sources: &mut HashMap<(PaneId, u32), u32>,
 ) {
+    // Prune sources that are no longer visible: a stale entry would keep its
+    // old host image referenced and block the superseded-image delete.
+    let current_sources: HashSet<(PaneId, u32)> = placements
+        .iter()
+        .map(|placement| (placement.pane_id, placement.placement.image_id))
+        .collect();
+    sources.retain(|source, _| current_sources.contains(source));
+
     let mut current_placements = HashSet::new();
     for placement in placements {
         let clipped = clipped_placement(placement);
@@ -265,6 +330,16 @@ fn encode_graphics_update(
             }
         }
 
+        release_superseded_source_image(
+            bytes,
+            sources,
+            host_images,
+            host_placements,
+            &mut current_placements,
+            (placement.pane_id, placement.placement.image_id),
+            host_id,
+        );
+
         // A different view can repaint the same cells with text or overlays and
         // leave the host-side Kitty placement state out of sync with this cache.
         // Re-emit the placement even when its geometry signature is unchanged.
@@ -306,6 +381,36 @@ fn encode_graphics_update(
     }
 }
 
+/// Records that `source` is now backed by `host_id` and deletes the host
+/// image it previously pointed at once no other source references it.
+fn release_superseded_source_image(
+    bytes: &mut Vec<u8>,
+    sources: &mut HashMap<(PaneId, u32), u32>,
+    host_images: &mut HashMap<u32, ImageSignature>,
+    host_placements: &mut HashMap<(u32, u32), PlacementSignature>,
+    current_placements: &mut HashSet<(u32, u32)>,
+    source: (PaneId, u32),
+    host_id: u32,
+) {
+    let Some(previous) = sources.insert(source, host_id) else {
+        return;
+    };
+    if previous == host_id || sources.values().any(|id| *id == previous) {
+        return;
+    }
+    encode_delete_image(bytes, previous);
+    host_images.remove(&previous);
+    // The `d=I` delete also removes the image's placements host-side.
+    host_placements.retain(|(image_id, placement_id), _| {
+        if *image_id == previous {
+            current_placements.remove(&(*image_id, *placement_id));
+            false
+        } else {
+            true
+        }
+    });
+}
+
 pub(crate) fn clear_all_host_graphics() -> io::Result<()> {
     let cache = LOCAL_HOST_GRAPHICS.get_or_init(|| Mutex::new(HostGraphicsCache::default()));
     let mut bytes = Vec::new();
@@ -321,6 +426,24 @@ pub(crate) fn clear_all_host_graphics() -> io::Result<()> {
 }
 
 impl HostGraphicsCache {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.images.is_empty() && self.placements.is_empty()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_mark_non_empty(&mut self) {
+        self.images.insert(
+            HOST_IMAGE_ID_BASE,
+            ImageSignature {
+                image_width: 1,
+                image_height: 1,
+                format_code: 32,
+                data_len: 4,
+                data_fingerprint: 1,
+            },
+        );
+    }
+
     pub(crate) fn clear_bytes(&mut self) -> Vec<u8> {
         let mut bytes = Vec::new();
         for id in self.images.keys().copied().collect::<Vec<_>>() {
@@ -328,6 +451,7 @@ impl HostGraphicsCache {
         }
         self.images.clear();
         self.placements.clear();
+        self.sources.clear();
         self.view = None;
         bytes
     }
@@ -352,6 +476,7 @@ fn active_view_key(app: &AppState) -> Option<HostViewKey> {
 
 fn collect_visible_placements(
     app: &AppState,
+    terminal_runtimes: &TerminalRuntimeRegistry,
     cell_size: HostCellSize,
     uploaded_images: &HashMap<u32, ImageSignature>,
 ) -> Vec<HostPlacement> {
@@ -374,13 +499,13 @@ fn collect_visible_placements(
 
     tracing::debug!(
         ws_idx,
-        terminal_runtimes_len = app.terminal_runtimes.len(),
+        terminal_runtimes_len = terminal_runtimes.len(),
         pane_infos_len = app.view.pane_infos.len(),
         "collect_visible_placements: starting iteration"
     );
     let mut placements = Vec::new();
     for info in &app.view.pane_infos {
-        let runtime = match app.runtime_for_pane_in_workspace(ws_idx, info.id) {
+        let runtime = match app.runtime_for_pane_in_workspace(terminal_runtimes, ws_idx, info.id) {
             Some(rt) => rt,
             None => {
                 tracing::debug!(pane_id = ?info.id, "collect_visible_placements: runtime not found");
@@ -793,6 +918,7 @@ mod tests {
     fn graphics_update_uploads_once_then_repositions_only() {
         let mut images = HashMap::new();
         let mut placements = HashMap::new();
+        let mut sources = HashMap::new();
         let mut bytes = Vec::new();
         let placement = test_placement(0, 0);
 
@@ -802,6 +928,7 @@ mod tests {
             false,
             &mut images,
             &mut placements,
+            &mut sources,
         );
         let first = String::from_utf8_lossy(&bytes);
         assert!(first.contains("a=t"));
@@ -809,7 +936,14 @@ mod tests {
 
         bytes.clear();
         let same = test_placement(0, 0);
-        encode_graphics_update(&mut bytes, &[same], false, &mut images, &mut placements);
+        encode_graphics_update(
+            &mut bytes,
+            &[same],
+            false,
+            &mut images,
+            &mut placements,
+            &mut sources,
+        );
         assert!(bytes.is_empty());
 
         let mut z_changed = test_placement(0, 0);
@@ -820,6 +954,7 @@ mod tests {
             false,
             &mut images,
             &mut placements,
+            &mut sources,
         );
         let z_changed_bytes = String::from_utf8_lossy(&bytes);
         assert!(!z_changed_bytes.contains("a=t"));
@@ -827,7 +962,14 @@ mod tests {
 
         bytes.clear();
         let moved = test_placement(0, 1);
-        encode_graphics_update(&mut bytes, &[moved], false, &mut images, &mut placements);
+        encode_graphics_update(
+            &mut bytes,
+            &[moved],
+            false,
+            &mut images,
+            &mut placements,
+            &mut sources,
+        );
         let moved_bytes = String::from_utf8_lossy(&bytes);
         assert!(!moved_bytes.contains("a=t"));
         assert!(moved_bytes.contains("a=p"));
@@ -837,6 +979,7 @@ mod tests {
     fn view_change_redisplays_unchanged_visible_placement() {
         let mut images = HashMap::new();
         let mut placements = HashMap::new();
+        let mut sources = HashMap::new();
         let mut bytes = Vec::new();
         let placement = test_placement(0, 0);
 
@@ -846,12 +989,20 @@ mod tests {
             false,
             &mut images,
             &mut placements,
+            &mut sources,
         );
         assert_eq!(placements.len(), 1);
 
         bytes.clear();
         let same = test_placement(0, 0);
-        encode_graphics_update(&mut bytes, &[same], true, &mut images, &mut placements);
+        encode_graphics_update(
+            &mut bytes,
+            &[same],
+            true,
+            &mut images,
+            &mut placements,
+            &mut sources,
+        );
         let redisplay = String::from_utf8_lossy(&bytes);
         assert!(!redisplay.contains("a=t"));
         assert!(redisplay.contains("a=p"));
@@ -859,9 +1010,46 @@ mod tests {
     }
 
     #[test]
+    fn surface_reset_deletes_then_reuploads_and_redisplays_placement() {
+        let mut cache = HostGraphicsCache::default();
+        let mut bytes = Vec::new();
+        let placement = test_placement(0, 0);
+
+        encode_graphics_update(
+            &mut bytes,
+            &[placement],
+            false,
+            &mut cache.images,
+            &mut cache.placements,
+            &mut cache.sources,
+        );
+        assert_eq!(cache.images.len(), 1);
+        assert_eq!(cache.placements.len(), 1);
+
+        bytes = cache.clear_bytes();
+        let same = test_placement(0, 0);
+        encode_graphics_update(
+            &mut bytes,
+            &[same],
+            false,
+            &mut cache.images,
+            &mut cache.placements,
+            &mut cache.sources,
+        );
+
+        let redisplay = String::from_utf8_lossy(&bytes);
+        assert!(redisplay.contains("a=d,d=I"));
+        assert!(redisplay.contains("a=t"));
+        assert!(redisplay.contains("a=p"));
+        assert_eq!(cache.images.len(), 1);
+        assert_eq!(cache.placements.len(), 1);
+    }
+
+    #[test]
     fn scrollback_offset_change_redisplays_placement() {
         let mut images = HashMap::new();
         let mut placements = HashMap::new();
+        let mut sources = HashMap::new();
         let mut bytes = Vec::new();
         let placement = test_placement(0, 0);
 
@@ -871,12 +1059,20 @@ mod tests {
             false,
             &mut images,
             &mut placements,
+            &mut sources,
         );
 
         bytes.clear();
         let mut scrolled = test_placement(0, 0);
         scrolled.scrollback_offset = 3;
-        encode_graphics_update(&mut bytes, &[scrolled], false, &mut images, &mut placements);
+        encode_graphics_update(
+            &mut bytes,
+            &[scrolled],
+            false,
+            &mut images,
+            &mut placements,
+            &mut sources,
+        );
         let redisplay = String::from_utf8_lossy(&bytes);
         assert!(!redisplay.contains("a=t"));
         assert!(redisplay.contains("a=p"));
@@ -886,6 +1082,7 @@ mod tests {
     fn empty_image_data_does_not_mark_image_uploaded() {
         let mut images = HashMap::new();
         let mut placements = HashMap::new();
+        let mut sources = HashMap::new();
         let mut bytes = Vec::new();
         let mut placement = test_placement(0, 0);
         placement.placement.data.clear();
@@ -896,6 +1093,7 @@ mod tests {
             false,
             &mut images,
             &mut placements,
+            &mut sources,
         );
 
         assert!(bytes.is_empty());
@@ -907,10 +1105,18 @@ mod tests {
     fn same_image_signature_reuses_host_upload_across_source_image_ids() {
         let mut images = HashMap::new();
         let mut placements = HashMap::new();
+        let mut sources = HashMap::new();
         let mut bytes = Vec::new();
         let first = test_placement(0, 0);
 
-        encode_graphics_update(&mut bytes, &[first], false, &mut images, &mut placements);
+        encode_graphics_update(
+            &mut bytes,
+            &[first],
+            false,
+            &mut images,
+            &mut placements,
+            &mut sources,
+        );
         assert_eq!(images.len(), 1);
         assert_eq!(placements.len(), 1);
 
@@ -925,6 +1131,7 @@ mod tests {
             false,
             &mut images,
             &mut placements,
+            &mut sources,
         );
 
         let reused = String::from_utf8_lossy(&bytes);
@@ -935,9 +1142,146 @@ mod tests {
     }
 
     #[test]
+    fn replaced_image_content_deletes_superseded_host_image() {
+        let mut images = HashMap::new();
+        let mut placements = HashMap::new();
+        let mut sources = HashMap::new();
+        let mut bytes = Vec::new();
+        let first = test_placement(0, 0);
+
+        encode_graphics_update(
+            &mut bytes,
+            &[first],
+            false,
+            &mut images,
+            &mut placements,
+            &mut sources,
+        );
+        assert_eq!(images.len(), 1);
+        let superseded_host_id = *images.keys().next().expect("uploaded host image");
+
+        // Same source image id, new pixel content: the fresh content maps to
+        // a fresh host image id, so the replaced one must be deleted.
+        bytes.clear();
+        let mut changed = test_placement(0, 0);
+        changed.placement.data_fingerprint = 43;
+        encode_graphics_update(
+            &mut bytes,
+            &[changed],
+            false,
+            &mut images,
+            &mut placements,
+            &mut sources,
+        );
+
+        let update = String::from_utf8_lossy(&bytes);
+        assert!(update.contains("a=t"), "changed content re-uploads");
+        assert!(
+            update.contains(&format!("a=d,d=I,i={superseded_host_id}")),
+            "superseded host image is deleted"
+        );
+        assert_eq!(images.len(), 1);
+        assert_eq!(placements.len(), 1);
+    }
+
+    #[test]
+    fn shared_host_image_survives_while_another_source_references_it() {
+        fn twin_placement() -> HostPlacement {
+            let mut twin = test_placement(5, 5);
+            twin.placement.image_id = 8;
+            twin.placement.placement_id = 4;
+            twin
+        }
+
+        let mut images = HashMap::new();
+        let mut placements = HashMap::new();
+        let mut sources = HashMap::new();
+        let mut bytes = Vec::new();
+
+        encode_graphics_update(
+            &mut bytes,
+            &[test_placement(0, 0), twin_placement()],
+            false,
+            &mut images,
+            &mut placements,
+            &mut sources,
+        );
+        assert_eq!(images.len(), 1, "same content dedups to one host image");
+
+        // One source moves to new content while the other still shows the
+        // old image: the shared host image must survive.
+        bytes.clear();
+        let mut changed = test_placement(0, 0);
+        changed.placement.data_fingerprint = 43;
+        encode_graphics_update(
+            &mut bytes,
+            &[changed, twin_placement()],
+            false,
+            &mut images,
+            &mut placements,
+            &mut sources,
+        );
+
+        let update = String::from_utf8_lossy(&bytes);
+        assert!(!update.contains("a=d,d=I"), "shared host image survives");
+        assert_eq!(images.len(), 2);
+    }
+
+    #[test]
+    fn stale_source_entry_does_not_block_superseded_image_delete() {
+        fn twin_placement() -> HostPlacement {
+            let mut twin = test_placement(5, 5);
+            twin.placement.image_id = 8;
+            twin.placement.placement_id = 4;
+            twin
+        }
+
+        let mut images = HashMap::new();
+        let mut placements = HashMap::new();
+        let mut sources = HashMap::new();
+        let mut bytes = Vec::new();
+
+        encode_graphics_update(
+            &mut bytes,
+            &[test_placement(0, 0), twin_placement()],
+            false,
+            &mut images,
+            &mut placements,
+            &mut sources,
+        );
+        assert_eq!(images.len(), 1);
+        assert_eq!(sources.len(), 2);
+        let shared_host_id = *images.keys().next().expect("uploaded host image");
+
+        // The twin source is gone and the survivor changed content: the
+        // vanished source's stale entry must not keep the old host image
+        // alive.
+        bytes.clear();
+        let mut changed = test_placement(0, 0);
+        changed.placement.data_fingerprint = 43;
+        encode_graphics_update(
+            &mut bytes,
+            &[changed],
+            false,
+            &mut images,
+            &mut placements,
+            &mut sources,
+        );
+
+        let update = String::from_utf8_lossy(&bytes);
+        assert!(
+            update.contains(&format!("a=d,d=I,i={shared_host_id}")),
+            "old host image is deleted once its last live source moves on"
+        );
+        assert_eq!(images.len(), 1);
+        assert_eq!(sources.len(), 1);
+    }
+
+    #[test]
     fn stale_placement_deletes_placement_not_image_immediately() {
         let mut images = HashMap::new();
         let mut placements = HashMap::new();
+        let mut sources = HashMap::new();
         let mut bytes = Vec::new();
         let placement = test_placement(0, 0);
 
@@ -947,11 +1291,19 @@ mod tests {
             false,
             &mut images,
             &mut placements,
+            &mut sources,
         );
         assert_eq!(placements.len(), 1);
 
         bytes.clear();
-        encode_graphics_update(&mut bytes, &[], false, &mut images, &mut placements);
+        encode_graphics_update(
+            &mut bytes,
+            &[],
+            false,
+            &mut images,
+            &mut placements,
+            &mut sources,
+        );
         let delete = String::from_utf8_lossy(&bytes);
         assert!(delete.contains("a=d,d=i"));
         assert!(!delete.contains("d=I"));
@@ -963,6 +1315,7 @@ mod tests {
     fn view_change_deletes_stale_placement_immediately() {
         let mut images = HashMap::new();
         let mut placements = HashMap::new();
+        let mut sources = HashMap::new();
         let mut bytes = Vec::new();
         let placement = test_placement(0, 0);
 
@@ -972,9 +1325,17 @@ mod tests {
             false,
             &mut images,
             &mut placements,
+            &mut sources,
         );
         bytes.clear();
-        encode_graphics_update(&mut bytes, &[], true, &mut images, &mut placements);
+        encode_graphics_update(
+            &mut bytes,
+            &[],
+            true,
+            &mut images,
+            &mut placements,
+            &mut sources,
+        );
 
         let delete = String::from_utf8_lossy(&bytes);
         assert!(delete.contains("a=d,d=i"));
